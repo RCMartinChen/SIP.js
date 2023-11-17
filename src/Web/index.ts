@@ -3,3 +3,4 @@ export { Modifiers };
 export { Simple } from "./Simple";
 export { SessionDescriptionHandler } from "./SessionDescriptionHandler";
 export { Transport } from "./Transport";
+export { TcpTransport } from "./TcpTransport";

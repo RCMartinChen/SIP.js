@@ -1,7 +1,7 @@
 /*!
  * 
  *  SIP version 0.13.5
- *  Copyright (c) 2014-2019 Junction Networks, Inc <http://www.onsip.com>
+ *  Copyright (c) 2014-2023 Junction Networks, Inc <http://www.onsip.com>
  *  Homepage: https://sipjs.com
  *  License: https://sipjs.com/license/
  * 
@@ -205,7 +205,7 @@ var URI_1 = __webpack_require__(12);
 exports.URI = URI_1.URI;
 var Utils_1 = __webpack_require__(13);
 exports.Utils = Utils_1.Utils;
-var Web = __webpack_require__(36);
+var Web = __webpack_require__(37);
 exports.Web = Web;
 // tslint:disable-next-line:no-var-requires
 var pkg = __webpack_require__(4);
@@ -22975,7 +22975,8 @@ var Transactions_1 = __webpack_require__(7);
 var URI_1 = __webpack_require__(12);
 var Utils_1 = __webpack_require__(13);
 var SessionDescriptionHandler_1 = __webpack_require__(32);
-var Transport_1 = __webpack_require__(35);
+var TcpTransport_1 = __webpack_require__(35);
+var Transport_1 = __webpack_require__(36);
 var environment = global.window || global;
 /**
  * @class Class creating a SIP User Agent.
@@ -23798,6 +23799,11 @@ var UA = /** @class */ (function (_super) {
         // Contact transport parameter
         if (settings.hackWssInTransport) {
             settings.contactTransport = "wss";
+        }
+        // support tcp transport (only work in electron)
+        if (settings.hackViaTcp) {
+            settings.contactTransport = "tcp";
+            settings.transportConstructor = TcpTransport_1.TcpTransport;
         }
         this.contact = {
             pubGruu: undefined,
@@ -24943,6 +24949,651 @@ var computeKeepAliveTimeout = function (upperBound) {
  * @class Transport
  * @param {Object} options
  */
+var TcpTransport = /** @class */ (function (_super) {
+    __extends(TcpTransport, _super);
+    function TcpTransport(logger, options) {
+        if (options === void 0) { options = {}; }
+        var _this = _super.call(this, logger, options) || this;
+        _this.WebSocket = (global.window || global).WebSocket;
+        _this.type = Enums_1.TypeStrings.Transport;
+        _this.reconnectionAttempts = 0;
+        _this.status = TransportStatus.STATUS_CONNECTING;
+        _this.configuration = {};
+        _this.loadConfig(options);
+        _this.initializeIpcChannel();
+        return _this;
+    }
+    /**
+     * @returns {Boolean}
+     */
+    TcpTransport.prototype.isConnected = function () {
+        return this.status === TransportStatus.STATUS_OPEN;
+    };
+    /**
+     * Send a message.
+     * @param {SIP.OutgoingRequest|String} msg
+     * @param {Object} [options]
+     * @returns {Promise}
+     */
+    TcpTransport.prototype.sendPromise = function (msg, options) {
+        if (options === void 0) { options = {}; }
+        if (!this.statusAssert(TransportStatus.STATUS_OPEN, options.force)) {
+            this.onError("unable to send message - tcp socket is not open");
+            return Promise.reject();
+        }
+        var message = msg.toString();
+        if (this.tcpChannelPort) {
+            if (this.configuration.traceSip === true) {
+                this.logger.log("sending tcp message:\n\n" + message + "\n");
+            }
+            this.tcpChannelPort.postMessage({ type: "send", payload: message });
+            return Promise.resolve({ msg: message });
+        }
+        else {
+            this.onError("unable to send message - tcp channel does not exist");
+            return Promise.reject();
+        }
+    };
+    /**
+     * Disconnect socket.
+     */
+    TcpTransport.prototype.disconnectPromise = function (options) {
+        var _this = this;
+        if (options === void 0) { options = {}; }
+        if (this.disconnectionPromise) { // Already disconnecting. Just return this.
+            return this.disconnectionPromise;
+        }
+        options.code = options.code || 1000;
+        if (!this.statusTransition(TransportStatus.STATUS_CLOSING, options.force)) {
+            if (this.status === TransportStatus.STATUS_CLOSED) { // tcp socket is already closed
+                return Promise.resolve({ overrideEvent: true });
+            }
+            else if (this.connectionPromise) { // tcp socket is connecting, cannot move to disconneting yet
+                return this.connectionPromise.then(function () { return Promise.reject("The tcp socket did not disconnect"); })
+                    .catch(function () { return Promise.resolve({ overrideEvent: true }); });
+            }
+            else {
+                // Cannot move to disconnecting, but not in connecting state.
+                return Promise.reject("The tcp socket did not disconnect");
+            }
+        }
+        this.emit("disconnecting");
+        this.disconnectionPromise = new Promise(function (resolve, reject) {
+            _this.disconnectDeferredResolve = resolve;
+            if (_this.reconnectTimer) {
+                clearTimeout(_this.reconnectTimer);
+                _this.reconnectTimer = undefined;
+            }
+            _this.logger.log("closing tcp socket" + _this.server.wsUri);
+            _this.tcpChannelPort.postMessage({ type: "close" });
+        });
+        return this.disconnectionPromise;
+    };
+    /**
+     * Connect socket.
+     */
+    TcpTransport.prototype.connectPromise = function (options) {
+        var _this = this;
+        if (options === void 0) { options = {}; }
+        if (this.status === TransportStatus.STATUS_CLOSING && !options.force) {
+            return Promise.reject("WebSocket " + this.server.wsUri + " is closing");
+        }
+        if (this.connectionPromise) {
+            return this.connectionPromise;
+        }
+        this.server = this.server || this.getNextWsServer(options.force);
+        this.connectionPromise = new Promise(function (resolve, reject) {
+            if ((_this.status === TransportStatus.STATUS_OPEN
+                || _this.status === TransportStatus.STATUS_CLOSING)
+                && !options.force) {
+                _this.logger.warn("tcp socket: " + _this.server.wsUri + " is already connected");
+                reject("Failed status check - attempted to open a connection but already open/closing");
+                return;
+            }
+            _this.connectDeferredResolve = resolve;
+            _this.status = TransportStatus.STATUS_CONNECTING;
+            _this.emit("connecting");
+            _this.logger.log("connecting to tcp socket " + _this.server.wsUri);
+            _this.disposeTcpSocket();
+            var url = Grammar_1.Grammar.parse(_this.server.wsUri, "absoluteURI");
+            _this.tcpChannelPort.postMessage({ type: "connect",
+                payload: { host: url.host, port: url.port, protocol: url.scheme, ca: _this.server.certificate } });
+            if (!_this.tcpChannelPort) {
+                reject("Unexpected instance tcp channel port not set");
+                return;
+            }
+            _this.connectionTimeout = setTimeout(function () {
+                _this.statusTransition(TransportStatus.STATUS_CLOSED);
+                _this.logger.warn("took too long to connect - exceeded time set in configuration.connectionTimeout: " +
+                    _this.configuration.connectionTimeout + "s");
+                _this.emit("disconnected", { code: 1000 });
+                _this.connectionPromise = undefined;
+                reject("Connection timeout");
+            }, _this.configuration.connectionTimeout * 1000);
+            _this.boundOnOpen = _this.onOpen.bind(_this);
+            _this.boundOnMessage = _this.onMessage.bind(_this);
+            _this.boundOnClose = _this.onClose.bind(_this);
+            _this.boundOnError = _this.onTcpSocketError.bind(_this);
+            _this.on("tcp_open", _this.boundOnOpen);
+            _this.on("tcp_message", _this.boundOnMessage);
+            _this.on("tcp_close", _this.boundOnClose);
+            _this.on("tcp_error", _this.boundOnError);
+        });
+        return this.connectionPromise;
+    };
+    /**
+     * @event
+     * @param {event} e
+     */
+    TcpTransport.prototype.onMessage = function (e) {
+        var data = e.data;
+        var finishedData;
+        if (!data) {
+            this.logger.warn("received empty message, message discarded");
+            return;
+        }
+        else if (typeof data !== "string") { // WebSocket binary message.
+            try {
+                // the UInt8Data was here prior to types, and doesn't check
+                finishedData = String.fromCharCode.apply(null, new Uint8Array(data));
+            }
+            catch (err) {
+                this.logger.warn("received tcp socket binary message failed to be converted into string, message discarded");
+                return;
+            }
+            if (this.configuration.traceSip === true) {
+                this.logger.log("received tcp socket binary message:\n\n" + data + "\n");
+            }
+        }
+        else { // tcp socket text message.
+            if (this.configuration.traceSip === true) {
+                this.logger.log("received tcp socket text message:\n\n" + data + "\n");
+            }
+            finishedData = data;
+        }
+        this.emit("message", finishedData);
+    };
+    // Transport Event Handlers
+    /**
+     * @event
+     * @param {event} e
+     */
+    TcpTransport.prototype.onOpen = function () {
+        this.status = TransportStatus.STATUS_OPEN; // quietly force status to open
+        this.emit("connected");
+        if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = undefined;
+        }
+        this.logger.log("tcp socket " + this.server.wsUri + " connected");
+        // Clear reconnectTimer since we are not disconnected
+        if (this.reconnectTimer !== undefined) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = undefined;
+        }
+        // Reset reconnectionAttempts
+        this.reconnectionAttempts = 0;
+        // Reset disconnection promise so we can disconnect from a fresh state
+        this.disconnectionPromise = undefined;
+        this.disconnectDeferredResolve = undefined;
+        if (this.connectDeferredResolve) {
+            this.connectDeferredResolve({ overrideEvent: true });
+        }
+        else {
+            this.logger.warn("Unexpected websocket.onOpen with no connectDeferredResolve");
+        }
+    };
+    /**
+     * @event
+     * @param {event} e
+     */
+    TcpTransport.prototype.onClose = function (e) {
+        this.logger.log("tcp socket disconnected (code: " + e.code + (e.reason ? "| reason: " + e.reason : "") + ")");
+        if (this.status !== TransportStatus.STATUS_CLOSING) {
+            this.logger.warn("tcp socket closed without SIP.js requesting it");
+            this.emit("transportError");
+        }
+        // Clean up connection variables so we can connect again from a fresh state
+        if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+        }
+        this.connectionTimeout = undefined;
+        this.connectionPromise = undefined;
+        this.connectDeferredResolve = undefined;
+        // Check whether the user requested to close.
+        if (this.disconnectDeferredResolve) {
+            this.disconnectDeferredResolve({ overrideEvent: true });
+            this.statusTransition(TransportStatus.STATUS_CLOSED);
+            this.disconnectDeferredResolve = undefined;
+            return;
+        }
+        this.status = TransportStatus.STATUS_CLOSED; // quietly force status to closed
+        this.emit("disconnected", { code: e.code, reason: e.reason });
+        this.reconnect();
+    };
+    TcpTransport.prototype.disposeTcpSocket = function () {
+        this.tcpChannelPort.postMessage({ type: "close" });
+    };
+    TcpTransport.prototype.initializeIpcChannel = function () {
+        var _this = this;
+        this.logger.log("init IPC channel with electron...");
+        var messageChannel = new MessageChannel();
+        this.tcpChannelPort = messageChannel.port1;
+        this.tcpChannelPort.onmessage = function (event) {
+            var data = event.data;
+            _this.logger.log("Received message from IPC channel: " + data);
+            if (data.type === "status" && data.payload === "connected") {
+                _this.emit("tcp_open");
+            }
+            else if (data.type === "status" && data.payload === "closed") {
+                _this.emit("tcp_close", { code: data.code });
+            }
+            else if (data.type === "status" && data.payload === "error") {
+                _this.emit("tcp_error");
+            }
+            else if (data.type === "message") {
+                _this.emit("tcp_message", data.payload);
+            }
+        };
+        if (window.jupiterElectron && window.jupiterElectron.ipcRenderer) {
+            window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port1]);
+        }
+    };
+    /**
+     * @event
+     * @param {string} e
+     */
+    TcpTransport.prototype.onError = function (e) {
+        this.logger.warn("Transport error: " + e);
+        this.emit("transportError");
+    };
+    /**
+     * @event
+     * @private
+     * @param {event} e
+     */
+    TcpTransport.prototype.onTcpSocketError = function () {
+        this.onError("The tcp socket had an error");
+    };
+    /**
+     * Reconnection attempt logic.
+     */
+    TcpTransport.prototype.reconnect = function () {
+        var _this = this;
+        if (this.reconnectionAttempts > 0) {
+            this.logger.log("Reconnection attempt " + this.reconnectionAttempts + " failed");
+        }
+        if (this.noAvailableServers()) {
+            this.logger.warn("no available tcp servers left - going to closed state");
+            this.status = TransportStatus.STATUS_CLOSED;
+            this.emit("closed");
+            this.resetServerErrorStatus();
+            return;
+        }
+        if (this.isConnected()) {
+            this.logger.warn("attempted to reconnect while connected - forcing disconnect");
+            this.disconnect({ force: true });
+        }
+        this.reconnectionAttempts += 1;
+        if (this.reconnectionAttempts > this.configuration.maxReconnectionAttempts) {
+            this.logger.warn("maximum reconnection attempts for tcpSocket " + this.server.wsUri);
+            this.logger.log("transport " + this.server.wsUri + " failed | connection state set to 'error'");
+            this.server.isError = true;
+            this.emit("transportError");
+            this.server = this.getNextWsServer();
+            this.reconnectionAttempts = 0;
+            this.reconnect();
+        }
+        else {
+            this.logger.log("trying to reconnect to tcp socket " +
+                this.server.wsUri + " (reconnection attempt " + this.reconnectionAttempts + ")");
+            this.reconnectTimer = setTimeout(function () {
+                _this.connect();
+                _this.reconnectTimer = undefined;
+            }, (this.reconnectionAttempts === 1) ? 0 : this.configuration.reconnectionTimeout * 1000);
+        }
+    };
+    /**
+     * Resets the error state of all servers in the configuration
+     */
+    TcpTransport.prototype.resetServerErrorStatus = function () {
+        for (var _i = 0, _a = this.configuration.wsServers; _i < _a.length; _i++) {
+            var server = _a[_i];
+            server.isError = false;
+        }
+    };
+    /**
+     * Retrieve the next server to which connect.
+     * @param {Boolean} force allows bypass of server error status checking
+     * @returns {Object} wsServer
+     */
+    TcpTransport.prototype.getNextWsServer = function (force) {
+        if (force === void 0) { force = false; }
+        if (this.noAvailableServers()) {
+            this.logger.warn("attempted to get next ws server but there are no available ws servers left");
+            return;
+        }
+        // Order servers by weight
+        var candidates = [];
+        for (var _i = 0, _a = this.configuration.wsServers; _i < _a.length; _i++) {
+            var wsServer = _a[_i];
+            if (wsServer.isError && !force) {
+                continue;
+            }
+            else if (candidates.length === 0) {
+                candidates.push(wsServer);
+            }
+            else if (wsServer.weight > candidates[0].weight) {
+                candidates = [wsServer];
+            }
+            else if (wsServer.weight === candidates[0].weight) {
+                candidates.push(wsServer);
+            }
+        }
+        var idx = Math.floor(Math.random() * candidates.length);
+        return candidates[idx];
+    };
+    /**
+     * Checks all configuration servers, returns true if all of them have isError: true and false otherwise
+     * @returns {Boolean}
+     */
+    TcpTransport.prototype.noAvailableServers = function () {
+        for (var _i = 0, _a = this.configuration.wsServers; _i < _a.length; _i++) {
+            var server = _a[_i];
+            if (!server.isError) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // ==============================
+    // Status Stuff
+    // ==============================
+    /**
+     * Checks given status against instance current status. Returns true if they match
+     * @param {Number} status
+     * @param {Boolean} [force]
+     * @returns {Boolean}
+     */
+    TcpTransport.prototype.statusAssert = function (status, force) {
+        if (status === this.status) {
+            return true;
+        }
+        else {
+            if (force) {
+                this.logger.warn("Attempted to assert " +
+                    Object.keys(TransportStatus)[this.status] + " as " +
+                    Object.keys(TransportStatus)[status] + "- continuing with option: 'force'");
+                return true;
+            }
+            else {
+                this.logger.warn("Tried to assert " +
+                    Object.keys(TransportStatus)[status] + " but is currently " +
+                    Object.keys(TransportStatus)[this.status]);
+                return false;
+            }
+        }
+    };
+    /**
+     * Transitions the status. Checks for legal transition via assertion beforehand
+     * @param {Number} status
+     * @param {Boolean} [force]
+     * @returns {Boolean}
+     */
+    TcpTransport.prototype.statusTransition = function (status, force) {
+        if (force === void 0) { force = false; }
+        this.logger.log("Attempting to transition status from " +
+            Object.keys(TransportStatus)[this.status] + " to " +
+            Object.keys(TransportStatus)[status]);
+        if ((status === TransportStatus.STATUS_CONNECTING && this.statusAssert(TransportStatus.STATUS_CLOSED, force)) ||
+            (status === TransportStatus.STATUS_OPEN && this.statusAssert(TransportStatus.STATUS_CONNECTING, force)) ||
+            (status === TransportStatus.STATUS_CLOSING && this.statusAssert(TransportStatus.STATUS_OPEN, force)) ||
+            (status === TransportStatus.STATUS_CLOSED)) {
+            this.status = status;
+            return true;
+        }
+        else {
+            this.logger.warn("Status transition failed - result: no-op - reason:" +
+                " either gave an nonexistent status or attempted illegal transition");
+            return false;
+        }
+    };
+    // ==============================
+    // Configuration Handling
+    // ==============================
+    /**
+     * Configuration load.
+     * returns {Boolean}
+     */
+    TcpTransport.prototype.loadConfig = function (configuration) {
+        var settings = {
+            wsServers: [{
+                    scheme: "TCP",
+                    sipUri: "<sip:edge.sip.onsip.com;transport=tcp;lr>",
+                    weight: 0,
+                    wsUri: "tcp://edge.sip.onsip.com",
+                    isError: false
+                }],
+            connectionTimeout: 5,
+            maxReconnectionAttempts: 3,
+            reconnectionTimeout: 4,
+            keepAliveInterval: 0,
+            keepAliveDebounce: 10,
+            // Logging
+            traceSip: false
+        };
+        var configCheck = this.getConfigurationCheck();
+        // Check Mandatory parameters
+        for (var parameter in configCheck.mandatory) {
+            if (!configuration.hasOwnProperty(parameter)) {
+                throw new Exceptions_1.Exceptions.ConfigurationError(parameter);
+            }
+            else {
+                var value = configuration[parameter];
+                var checkedValue = configCheck.mandatory[parameter](value);
+                if (checkedValue !== undefined) {
+                    settings[parameter] = checkedValue;
+                }
+                else {
+                    throw new Exceptions_1.Exceptions.ConfigurationError(parameter, value);
+                }
+            }
+        }
+        // Check Optional parameters
+        for (var parameter in configCheck.optional) {
+            if (configuration.hasOwnProperty(parameter)) {
+                var value = configuration[parameter];
+                // If the parameter value is an empty array, but shouldn't be, apply its default value.
+                // If the parameter value is null, empty string, or undefined then apply its default value.
+                // If it's a number with NaN value then also apply its default value.
+                // NOTE: JS does not allow "value === NaN", the following does the work:
+                if ((value instanceof Array && value.length === 0) ||
+                    (value === null || value === "" || value === undefined) ||
+                    (typeof (value) === "number" && isNaN(value))) {
+                    continue;
+                }
+                var checkedValue = configCheck.optional[parameter](value);
+                if (checkedValue !== undefined) {
+                    settings[parameter] = checkedValue;
+                }
+                else {
+                    throw new Exceptions_1.Exceptions.ConfigurationError(parameter, value);
+                }
+            }
+        }
+        var skeleton = {}; // Fill the value of the configuration_skeleton
+        for (var parameter in settings) {
+            if (settings.hasOwnProperty(parameter)) {
+                skeleton[parameter] = {
+                    value: settings[parameter],
+                };
+            }
+        }
+        Object.defineProperties(this.configuration, skeleton);
+        this.logger.log("configuration parameters after validation:");
+        for (var parameter in settings) {
+            if (settings.hasOwnProperty(parameter)) {
+                this.logger.log("· " + parameter + ": " + JSON.stringify(settings[parameter]));
+            }
+        }
+        return;
+    };
+    /**
+     * Configuration checker.
+     * @return {Boolean}
+     */
+    TcpTransport.prototype.getConfigurationCheck = function () {
+        return {
+            mandatory: {},
+            optional: {
+                // Note: this function used to call 'this.logger.error' but calling 'this' with anything here is invalid
+                wsServers: function (wsServers) {
+                    /* Allow defining wsServers parameter as:
+                     *  String: "host"
+                     *  Array of Strings: ["host1", "host2"]
+                     *  Array of Objects: [{wsUri:"host1", weight:1}, {wsUri:"host2", weight:0}]
+                     *  Array of Objects and Strings: [{wsUri:"host1"}, "host2"]
+                     */
+                    if (typeof wsServers === "string") {
+                        wsServers = [{ wsUri: wsServers }];
+                    }
+                    else if (wsServers instanceof Array) {
+                        for (var idx = 0; idx < wsServers.length; idx++) {
+                            if (typeof wsServers[idx] === "string") {
+                                wsServers[idx] = { wsUri: wsServers[idx] };
+                            }
+                        }
+                    }
+                    else {
+                        return;
+                    }
+                    if (wsServers.length === 0) {
+                        return false;
+                    }
+                    for (var _i = 0, wsServers_1 = wsServers; _i < wsServers_1.length; _i++) {
+                        var wsServer = wsServers_1[_i];
+                        if (!wsServer.wsUri) {
+                            return;
+                        }
+                        if (wsServer.weight && !Number(wsServer.weight)) {
+                            return;
+                        }
+                        var url = Grammar_1.Grammar.parse(wsServer.wsUri, "absoluteURI");
+                        if (url === -1) {
+                            return;
+                        }
+                        else {
+                            wsServer.sipUri = "<sip:" + url.host +
+                                (url.port ? ":" + url.port : "") + ";transport=" + url.scheme.replace(/^wss$/i, "tcp") + ";lr>";
+                            if (!wsServer.weight) {
+                                wsServer.weight = 0;
+                            }
+                            wsServer.isError = false;
+                            wsServer.scheme = url.scheme.toUpperCase();
+                        }
+                    }
+                    return wsServers;
+                },
+                keepAliveInterval: function (keepAliveInterval) {
+                    if (Utils_1.Utils.isDecimal(keepAliveInterval)) {
+                        var value = Number(keepAliveInterval);
+                        if (value > 0) {
+                            return value;
+                        }
+                    }
+                },
+                keepAliveDebounce: function (keepAliveDebounce) {
+                    if (Utils_1.Utils.isDecimal(keepAliveDebounce)) {
+                        var value = Number(keepAliveDebounce);
+                        if (value > 0) {
+                            return value;
+                        }
+                    }
+                },
+                traceSip: function (traceSip) {
+                    if (typeof traceSip === "boolean") {
+                        return traceSip;
+                    }
+                },
+                connectionTimeout: function (connectionTimeout) {
+                    if (Utils_1.Utils.isDecimal(connectionTimeout)) {
+                        var value = Number(connectionTimeout);
+                        if (value > 0) {
+                            return value;
+                        }
+                    }
+                },
+                maxReconnectionAttempts: function (maxReconnectionAttempts) {
+                    if (Utils_1.Utils.isDecimal(maxReconnectionAttempts)) {
+                        var value = Number(maxReconnectionAttempts);
+                        if (value >= 0) {
+                            return value;
+                        }
+                    }
+                },
+                reconnectionTimeout: function (reconnectionTimeout) {
+                    if (Utils_1.Utils.isDecimal(reconnectionTimeout)) {
+                        var value = Number(reconnectionTimeout);
+                        if (value > 0) {
+                            return value;
+                        }
+                    }
+                }
+            }
+        };
+    };
+    TcpTransport.C = TransportStatus;
+    return TcpTransport;
+}(Transport_1.Transport));
+exports.TcpTransport = TcpTransport;
+
+/* WEBPACK VAR INJECTION */}.call(this, __webpack_require__(31)))
+
+/***/ }),
+/* 36 */
+/***/ (function(module, exports, __webpack_require__) {
+
+"use strict";
+/* WEBPACK VAR INJECTION */(function(global) {
+var __extends = (this && this.__extends) || (function () {
+    var extendStatics = function (d, b) {
+        extendStatics = Object.setPrototypeOf ||
+            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+            function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+        return extendStatics(d, b);
+    };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+var Enums_1 = __webpack_require__(5);
+var Exceptions_1 = __webpack_require__(19);
+var Grammar_1 = __webpack_require__(9);
+var Transport_1 = __webpack_require__(29);
+var Utils_1 = __webpack_require__(13);
+var TransportStatus;
+(function (TransportStatus) {
+    TransportStatus[TransportStatus["STATUS_CONNECTING"] = 0] = "STATUS_CONNECTING";
+    TransportStatus[TransportStatus["STATUS_OPEN"] = 1] = "STATUS_OPEN";
+    TransportStatus[TransportStatus["STATUS_CLOSING"] = 2] = "STATUS_CLOSING";
+    TransportStatus[TransportStatus["STATUS_CLOSED"] = 3] = "STATUS_CLOSED";
+})(TransportStatus = exports.TransportStatus || (exports.TransportStatus = {}));
+/**
+ * Compute an amount of time in seconds to wait before sending another
+ * keep-alive.
+ * @returns {Number}
+ */
+var computeKeepAliveTimeout = function (upperBound) {
+    var lowerBound = upperBound * 0.8;
+    return 1000 * (Math.random() * (upperBound - lowerBound) + lowerBound);
+};
+/**
+ * @class Transport
+ * @param {Object} options
+ */
 var Transport = /** @class */ (function (_super) {
     __extends(Transport, _super);
     function Transport(logger, options) {
@@ -25609,7 +26260,7 @@ exports.Transport = Transport;
 /* WEBPACK VAR INJECTION */}.call(this, __webpack_require__(31)))
 
 /***/ }),
-/* 36 */
+/* 37 */
 /***/ (function(module, exports, __webpack_require__) {
 
 "use strict";
@@ -25617,16 +26268,18 @@ exports.Transport = Transport;
 Object.defineProperty(exports, "__esModule", { value: true });
 var Modifiers = __webpack_require__(33);
 exports.Modifiers = Modifiers;
-var Simple_1 = __webpack_require__(37);
+var Simple_1 = __webpack_require__(38);
 exports.Simple = Simple_1.Simple;
 var SessionDescriptionHandler_1 = __webpack_require__(32);
 exports.SessionDescriptionHandler = SessionDescriptionHandler_1.SessionDescriptionHandler;
-var Transport_1 = __webpack_require__(35);
+var Transport_1 = __webpack_require__(36);
 exports.Transport = Transport_1.Transport;
+var TcpTransport_1 = __webpack_require__(35);
+exports.TcpTransport = TcpTransport_1.TcpTransport;
 
 
 /***/ }),
-/* 37 */
+/* 38 */
 /***/ (function(module, exports, __webpack_require__) {
 
 "use strict";

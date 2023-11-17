@@ -51,6 +51,7 @@ import { Utils } from "./Utils";
 import {
   SessionDescriptionHandler as WebSessionDescriptionHandler
 } from "./Web/SessionDescriptionHandler";
+import { TcpTransport } from "./Web/TcpTransport";
 import { Transport as WebTransport } from "./Web/Transport";
 
 const environment = (global as any).window || global;
@@ -1024,6 +1025,12 @@ private checkTransaction(request: IncomingRequest): boolean {
     // Contact transport parameter
     if (settings.hackWssInTransport) {
       settings.contactTransport = "wss";
+    }
+
+    // support tcp transport (only work in electron)
+    if (settings.hackViaTcp) {
+      settings.contactTransport = "tcp";
+      settings.transportConstructor = TcpTransport;
     }
 
     this.contact = {
