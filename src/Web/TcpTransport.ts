@@ -304,7 +304,7 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
     this.tcpChannelPort = messageChannel.port1;
     this.tcpChannelPort.onmessage = (event: any) => {
       const data = event.data;
-      this.logger.log("Received message from IPC channel: " + data);
+      this.logger.log("Received message from IPC channel: " + JSON.stringify(data));
       if (data.type === "status" && data.payload === "connected") {
         this.emit("tcp_open");
       } else if (data.type === "status" && data.payload === "closed") {
@@ -312,11 +312,11 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
       } else if (data.type === "status" && data.payload === "error") {
         this.emit("tcp_error");
       } else if (data.type === "message") {
-        this.emit("tcp_message", data.payload);
+        this.emit("tcp_message", {data: data.payload});
       }
     };
     if (window.jupiterElectron && window.jupiterElectron.ipcRenderer) {
-      window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port1]);
+      window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port2]);
     }
   }
 

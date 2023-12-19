@@ -25181,7 +25181,7 @@ var TcpTransport = /** @class */ (function (_super) {
         this.tcpChannelPort = messageChannel.port1;
         this.tcpChannelPort.onmessage = function (event) {
             var data = event.data;
-            _this.logger.log("Received message from IPC channel: " + data);
+            _this.logger.log("Received message from IPC channel: " + JSON.stringify(data));
             if (data.type === "status" && data.payload === "connected") {
                 _this.emit("tcp_open");
             }
@@ -25192,11 +25192,11 @@ var TcpTransport = /** @class */ (function (_super) {
                 _this.emit("tcp_error");
             }
             else if (data.type === "message") {
-                _this.emit("tcp_message", data.payload);
+                _this.emit("tcp_message", { data: data.payload });
             }
         };
         if (window.jupiterElectron && window.jupiterElectron.ipcRenderer) {
-            window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port1]);
+            window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port2]);
         }
     };
     /**
