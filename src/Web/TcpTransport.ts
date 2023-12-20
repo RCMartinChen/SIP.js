@@ -35,7 +35,7 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
   public server: any;
   public ws: any;
 
-  private WebSocket = ((global as any).window || global).WebSocket;
+  private tcpSocket: any;
 
   private connectionPromise: Promise<any> | undefined;
   private connectDeferredResolve: ((obj: any) => void) | undefined;
@@ -55,8 +55,6 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
   private boundOnClose: any;
   private boundOnError: any;
 
-  private tcpChannelPort: any;
-
   constructor(logger: Logger, options: any = {}) {
     super(logger, options);
     this.type = TypeStrings.Transport;
@@ -65,7 +63,7 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
     this.status = TransportStatus.STATUS_CONNECTING;
     this.configuration = {};
     this.loadConfig(options);
-    this.initializeIpcChannel();
+    this.logger.log("initialize the tcp transport");
   }
 
   /**
@@ -89,11 +87,11 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
 
     const message: string = msg.toString();
 
-    if (this.tcpChannelPort) {
+    if (this.tcpSocket) {
       if (this.configuration.traceSip === true) {
         this.logger.log("sending tcp message:\n\n" + message + "\n");
       }
-      this.tcpChannelPort.postMessage({type: "send", payload: message});
+      this.tcpSocket.send(message);
       return Promise.resolve({msg: message});
     } else {
       this.onError("unable to send message - tcp channel does not exist");
@@ -121,6 +119,10 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
         return Promise.reject("The tcp socket did not disconnect");
       }
     }
+    if (this.connectionTimeout) {
+      clearTimeout(this.connectionTimeout);
+      this.connectionTimeout = undefined;
+    }
     this.emit("disconnecting");
     this.disconnectionPromise = new Promise((resolve, reject) => {
       this.disconnectDeferredResolve = resolve;
@@ -130,8 +132,12 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
         this.reconnectTimer = undefined;
       }
 
-      this.logger.log("closing tcp socket" + this.server.wsUri);
-      this.tcpChannelPort.postMessage({type: "close"});
+      if (this.tcpSocket) {
+        this.logger.log("closing tcp socket " + this.server.wsUri);
+        this.tcpSocket.disconnect();
+      } else {
+        reject("Attempted to disconnect but the websocket doesn't exist");
+      }
     });
 
     return this.disconnectionPromise;
@@ -142,7 +148,7 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
    */
   protected connectPromise(options: any = {}) {
     if (this.status === TransportStatus.STATUS_CLOSING && !options.force) {
-      return Promise.reject("WebSocket " + this.server.wsUri + " is closing");
+      return Promise.reject("tcp socket " + this.server.wsUri + " is closing");
     }
     if (this.connectionPromise) {
       return this.connectionPromise;
@@ -163,14 +169,11 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
       this.logger.log("connecting to tcp socket " + this.server.wsUri);
       this.disposeTcpSocket();
       const url = Grammar.parse(this.server.wsUri, "absoluteURI");
-      this.tcpChannelPort.postMessage({type: "connect",
-        payload: {host: url.host, port: url.port, protocol: url.scheme, ca: this.server.certificate}});
-
-      if (!this.tcpChannelPort) {
-        reject("Unexpected instance tcp channel port not set");
-        return;
-      }
-
+      this.tcpSocket = new window.jupiterElectron.TcpSipClient(url.host,
+        url.port,
+        url.scheme === "tls" ? true : false,
+        this.server.certificate);
+      this.tcpSocket.connect();
       this.connectionTimeout = setTimeout(() => {
         this.statusTransition(TransportStatus.STATUS_CLOSED);
         this.logger.warn("took too long to connect - exceeded time set in configuration.connectionTimeout: " +
@@ -185,10 +188,10 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
       this.boundOnClose = this.onClose.bind(this);
       this.boundOnError = this.onTcpSocketError.bind(this);
 
-      this.on("tcp_open", this.boundOnOpen);
-      this.on("tcp_message", this.boundOnMessage);
-      this.on("tcp_close", this.boundOnClose);
-      this.on("tcp_error", this.boundOnError);
+      this.tcpSocket.addEventListener("open", this.boundOnOpen);
+      this.tcpSocket.addEventListener("message", this.boundOnMessage);
+      this.tcpSocket.addEventListener("close", this.boundOnClose);
+      this.tcpSocket.addEventListener("error", this.boundOnError);
     });
 
     return this.connectionPromise;
@@ -266,8 +269,6 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
    * @param {event} e
    */
   private onClose(e: any): void {
-    this.logger.log("tcp socket disconnected (code: " + e.code + (e.reason ? "| reason: " + e.reason : "") + ")");
-
     if (this.status !== TransportStatus.STATUS_CLOSING) {
       this.logger.warn("tcp socket closed without SIP.js requesting it");
       this.emit("transportError");
@@ -290,33 +291,14 @@ export class TcpTransport extends TransportBase implements TransportDefinition {
     }
 
     this.status = TransportStatus.STATUS_CLOSED; // quietly force status to closed
-    this.emit("disconnected", {code: e.code, reason: e.reason});
+    this.emit("disconnected", {code: "", reason: ""});
     this.reconnect();
   }
 
   private disposeTcpSocket(): void {
-    this.tcpChannelPort.postMessage({type: "close"});
-  }
-
-  private initializeIpcChannel(): void {
-    this.logger.log("init IPC channel with electron...");
-    const messageChannel = new MessageChannel();
-    this.tcpChannelPort = messageChannel.port1;
-    this.tcpChannelPort.onmessage = (event: any) => {
-      const data = event.data;
-      this.logger.log("Received message from IPC channel: " + JSON.stringify(data));
-      if (data.type === "status" && data.payload === "connected") {
-        this.emit("tcp_open");
-      } else if (data.type === "status" && data.payload === "closed") {
-        this.emit("tcp_close", { code: data.code });
-      } else if (data.type === "status" && data.payload === "error") {
-        this.emit("tcp_error");
-      } else if (data.type === "message") {
-        this.emit("tcp_message", {data: data.payload});
-      }
-    };
-    if (window.jupiterElectron && window.jupiterElectron.ipcRenderer) {
-      window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port2]);
+    if (this.tcpSocket) {
+      this.tcpSocket.disconnect();
+      this.tcpSocket = undefined;
     }
   }
 

@@ -24909,7 +24909,7 @@ exports.SessionDescriptionHandlerObserver = SessionDescriptionHandlerObserver;
 /***/ (function(module, exports, __webpack_require__) {
 
 "use strict";
-/* WEBPACK VAR INJECTION */(function(global) {
+
 var __extends = (this && this.__extends) || (function () {
     var extendStatics = function (d, b) {
         extendStatics = Object.setPrototypeOf ||
@@ -24954,13 +24954,12 @@ var TcpTransport = /** @class */ (function (_super) {
     function TcpTransport(logger, options) {
         if (options === void 0) { options = {}; }
         var _this = _super.call(this, logger, options) || this;
-        _this.WebSocket = (global.window || global).WebSocket;
         _this.type = Enums_1.TypeStrings.Transport;
         _this.reconnectionAttempts = 0;
         _this.status = TransportStatus.STATUS_CONNECTING;
         _this.configuration = {};
         _this.loadConfig(options);
-        _this.initializeIpcChannel();
+        _this.logger.log("initialize the tcp transport");
         return _this;
     }
     /**
@@ -24982,11 +24981,11 @@ var TcpTransport = /** @class */ (function (_super) {
             return Promise.reject();
         }
         var message = msg.toString();
-        if (this.tcpChannelPort) {
+        if (this.tcpSocket) {
             if (this.configuration.traceSip === true) {
                 this.logger.log("sending tcp message:\n\n" + message + "\n");
             }
-            this.tcpChannelPort.postMessage({ type: "send", payload: message });
+            this.tcpSocket.send(message);
             return Promise.resolve({ msg: message });
         }
         else {
@@ -25017,6 +25016,10 @@ var TcpTransport = /** @class */ (function (_super) {
                 return Promise.reject("The tcp socket did not disconnect");
             }
         }
+        if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = undefined;
+        }
         this.emit("disconnecting");
         this.disconnectionPromise = new Promise(function (resolve, reject) {
             _this.disconnectDeferredResolve = resolve;
@@ -25024,8 +25027,13 @@ var TcpTransport = /** @class */ (function (_super) {
                 clearTimeout(_this.reconnectTimer);
                 _this.reconnectTimer = undefined;
             }
-            _this.logger.log("closing tcp socket" + _this.server.wsUri);
-            _this.tcpChannelPort.postMessage({ type: "close" });
+            if (_this.tcpSocket) {
+                _this.logger.log("closing tcp socket " + _this.server.wsUri);
+                _this.tcpSocket.disconnect();
+            }
+            else {
+                reject("Attempted to disconnect but the websocket doesn't exist");
+            }
         });
         return this.disconnectionPromise;
     };
@@ -25036,7 +25044,7 @@ var TcpTransport = /** @class */ (function (_super) {
         var _this = this;
         if (options === void 0) { options = {}; }
         if (this.status === TransportStatus.STATUS_CLOSING && !options.force) {
-            return Promise.reject("WebSocket " + this.server.wsUri + " is closing");
+            return Promise.reject("tcp socket " + this.server.wsUri + " is closing");
         }
         if (this.connectionPromise) {
             return this.connectionPromise;
@@ -25056,12 +25064,8 @@ var TcpTransport = /** @class */ (function (_super) {
             _this.logger.log("connecting to tcp socket " + _this.server.wsUri);
             _this.disposeTcpSocket();
             var url = Grammar_1.Grammar.parse(_this.server.wsUri, "absoluteURI");
-            _this.tcpChannelPort.postMessage({ type: "connect",
-                payload: { host: url.host, port: url.port, protocol: url.scheme, ca: _this.server.certificate } });
-            if (!_this.tcpChannelPort) {
-                reject("Unexpected instance tcp channel port not set");
-                return;
-            }
+            _this.tcpSocket = new window.jupiterElectron.TcpSipClient(url.host, url.port, url.scheme === "tls" ? true : false, _this.server.certificate);
+            _this.tcpSocket.connect();
             _this.connectionTimeout = setTimeout(function () {
                 _this.statusTransition(TransportStatus.STATUS_CLOSED);
                 _this.logger.warn("took too long to connect - exceeded time set in configuration.connectionTimeout: " +
@@ -25074,10 +25078,10 @@ var TcpTransport = /** @class */ (function (_super) {
             _this.boundOnMessage = _this.onMessage.bind(_this);
             _this.boundOnClose = _this.onClose.bind(_this);
             _this.boundOnError = _this.onTcpSocketError.bind(_this);
-            _this.on("tcp_open", _this.boundOnOpen);
-            _this.on("tcp_message", _this.boundOnMessage);
-            _this.on("tcp_close", _this.boundOnClose);
-            _this.on("tcp_error", _this.boundOnError);
+            _this.tcpSocket.addEventListener("open", _this.boundOnOpen);
+            _this.tcpSocket.addEventListener("message", _this.boundOnMessage);
+            _this.tcpSocket.addEventListener("close", _this.boundOnClose);
+            _this.tcpSocket.addEventListener("error", _this.boundOnError);
         });
         return this.connectionPromise;
     };
@@ -25148,7 +25152,6 @@ var TcpTransport = /** @class */ (function (_super) {
      * @param {event} e
      */
     TcpTransport.prototype.onClose = function (e) {
-        this.logger.log("tcp socket disconnected (code: " + e.code + (e.reason ? "| reason: " + e.reason : "") + ")");
         if (this.status !== TransportStatus.STATUS_CLOSING) {
             this.logger.warn("tcp socket closed without SIP.js requesting it");
             this.emit("transportError");
@@ -25168,35 +25171,13 @@ var TcpTransport = /** @class */ (function (_super) {
             return;
         }
         this.status = TransportStatus.STATUS_CLOSED; // quietly force status to closed
-        this.emit("disconnected", { code: e.code, reason: e.reason });
+        this.emit("disconnected", { code: "", reason: "" });
         this.reconnect();
     };
     TcpTransport.prototype.disposeTcpSocket = function () {
-        this.tcpChannelPort.postMessage({ type: "close" });
-    };
-    TcpTransport.prototype.initializeIpcChannel = function () {
-        var _this = this;
-        this.logger.log("init IPC channel with electron...");
-        var messageChannel = new MessageChannel();
-        this.tcpChannelPort = messageChannel.port1;
-        this.tcpChannelPort.onmessage = function (event) {
-            var data = event.data;
-            _this.logger.log("Received message from IPC channel: " + JSON.stringify(data));
-            if (data.type === "status" && data.payload === "connected") {
-                _this.emit("tcp_open");
-            }
-            else if (data.type === "status" && data.payload === "closed") {
-                _this.emit("tcp_close", { code: data.code });
-            }
-            else if (data.type === "status" && data.payload === "error") {
-                _this.emit("tcp_error");
-            }
-            else if (data.type === "message") {
-                _this.emit("tcp_message", { data: data.payload });
-            }
-        };
-        if (window.jupiterElectron && window.jupiterElectron.ipcRenderer) {
-            window.jupiterElectron.ipcRenderer.postMessage("SIP_NEW_TCP_CHANNEL_PORT", null, [messageChannel.port2]);
+        if (this.tcpSocket) {
+            this.tcpSocket.disconnect();
+            this.tcpSocket = undefined;
         }
     };
     /**
@@ -25547,7 +25528,6 @@ var TcpTransport = /** @class */ (function (_super) {
 }(Transport_1.Transport));
 exports.TcpTransport = TcpTransport;
 
-/* WEBPACK VAR INJECTION */}.call(this, __webpack_require__(31)))
 
 /***/ }),
 /* 36 */
